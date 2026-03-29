@@ -5,9 +5,13 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
+from dataclasses import dataclass, field
+import hashlib
+import json
 from pathlib import Path
 import traceback
 from threading import Lock
+from typing import Any
 
 from bs4 import BeautifulSoup as bs
 from bs4 import Tag
@@ -20,6 +24,70 @@ from book_maker.utils import num_tokens_from_text, prompt_config_to_kwargs
 
 from .base_loader import BaseBookLoader
 from .helper import EPUBBookLoaderHelper, is_text_link, not_trans
+
+DEFAULT_TRANSLATE_TAGS = "auto"
+AUTO_TRANSLATE_TAGS = (
+    "p",
+    "div",
+    "li",
+    "blockquote",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "figcaption",
+    "caption",
+    "td",
+    "th",
+    "dt",
+    "dd",
+)
+AUTO_EXCLUDE_TRANSLATE_TAGS = ("pre", "code", "script", "style", "svg", "math")
+
+
+@dataclass
+class TranslationSegment:
+    segment_id: str
+    item_file_name: str
+    ordinal: int
+    text: str
+    node: Any
+
+
+@dataclass
+class TranslationCheckpoint:
+    source_path: str
+    source_sha256: str
+    config: dict[str, Any]
+    config_fingerprint: str
+    translations: dict[str, str] = field(default_factory=dict)
+    committed_batches: int = 0
+    completed_count: int = 0
+
+    def to_dict(self):
+        return {
+            "source_path": self.source_path,
+            "source_sha256": self.source_sha256,
+            "config": self.config,
+            "config_fingerprint": self.config_fingerprint,
+            "translations": self.translations,
+            "committed_batches": self.committed_batches,
+            "completed_count": self.completed_count,
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        return cls(
+            source_path=payload["source_path"],
+            source_sha256=payload["source_sha256"],
+            config=payload["config"],
+            config_fingerprint=payload["config_fingerprint"],
+            translations=dict(payload.get("translations", {})),
+            committed_batches=payload.get("committed_batches", 0),
+            completed_count=payload.get("completed_count", 0),
+        )
 
 
 class EPUBBookLoader(BaseBookLoader):
@@ -55,7 +123,7 @@ class EPUBBookLoader(BaseBookLoader):
         )
         self.is_test = is_test
         self.test_num = test_num
-        self.translate_tags = "p"
+        self.translate_tags = DEFAULT_TRANSLATE_TAGS
         self.exclude_translate_tags = "sup"
         self.allow_navigable_strings = False
         self.accumulated_num = 1
@@ -78,6 +146,13 @@ class EPUBBookLoader(BaseBookLoader):
         self.enable_parallel = False
         self._progress_lock = Lock()
         self._translation_index = 0
+        self._legacy_state_loaded = False
+        self._checkpoint_state = None
+        self.prompt_config = prompt_config or {}
+        self.bin_path = f"{Path(epub_name).parent}/.{Path(epub_name).stem}.temp.bin"
+        self.checkpoint_path = (
+            f"{Path(epub_name).parent}/.{Path(epub_name).stem}.translation_state.json"
+        )
         self.set_parallel_workers(parallel_workers)
 
         # monkey patch for # 173
@@ -123,9 +198,6 @@ class EPUBBookLoader(BaseBookLoader):
 
         self.p_to_save = []
         self.resume = resume
-        self.bin_path = f"{Path(epub_name).parent}/.{Path(epub_name).stem}.temp.bin"
-        if self.resume:
-            self.load_state()
 
     @staticmethod
     def _is_special_text(text):
@@ -209,8 +281,383 @@ class EPUBBookLoader(BaseBookLoader):
 
         return fixed_toc
 
+    @staticmethod
+    def _normalize_tag_csv(tag_csv):
+        return [tag.strip().lower() for tag in tag_csv.split(",") if tag.strip()]
+
+    def _is_auto_translate_tags(self):
+        configured_tags = self._normalize_tag_csv(self.translate_tags)
+        if not configured_tags:
+            return True
+        return any(tag in {"auto", "all", "*"} for tag in configured_tags)
+
+    def _get_translate_tag_names(self):
+        if self._is_auto_translate_tags():
+            return list(AUTO_TRANSLATE_TAGS)
+        return self._normalize_tag_csv(self.translate_tags)
+
+    def _get_exclude_translate_tag_names(self):
+        exclude_tags = self._normalize_tag_csv(self.exclude_translate_tags)
+        if self._is_auto_translate_tags():
+            exclude_tags.extend(AUTO_EXCLUDE_TRANSLATE_TAGS)
+        return list(dict.fromkeys(exclude_tags))
+
+    def _should_use_checkpoint_pipeline(self):
+        return not any(
+            [
+                self.retranslate,
+                self.batch_flag,
+                self.batch_use_flag,
+                self.single_translate and self.block_size > 0,
+            ]
+        )
+
+    def _compute_source_sha256(self):
+        digest = hashlib.sha256()
+        with open(self.epub_name, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _build_runtime_config(self):
+        prompt_template = getattr(self.translate_model, "prompt_template", None)
+        if prompt_template is None:
+            prompt_template = getattr(self.translate_model, "prompt", "")
+
+        prompt_sys_msg = getattr(self.translate_model, "prompt_sys_msg", "")
+        runtime_config = {
+            "language": self.translate_model.language,
+            "translator": self.translate_model.__class__.__name__,
+            "selected_model_name": getattr(self, "selected_model_name", None),
+            "translator_model": getattr(self.translate_model, "model", None),
+            "prompt_template": prompt_template,
+            "prompt_sys_msg": prompt_sys_msg,
+            "translate_tags": self.translate_tags,
+            "exclude_translate_tags": self.exclude_translate_tags,
+            "allow_navigable_strings": self.allow_navigable_strings,
+            "single_translate": self.single_translate,
+            "accumulated_num": self.accumulated_num,
+            "context_flag": self.context_flag,
+        }
+        runtime_payload = json.dumps(
+            runtime_config, sort_keys=True, ensure_ascii=False
+        )
+        return runtime_config, hashlib.sha256(runtime_payload.encode("utf-8")).hexdigest()
+
+    def _default_checkpoint_state(self):
+        config, config_fingerprint = self._build_runtime_config()
+        return TranslationCheckpoint(
+            source_path=str(Path(self.epub_name).resolve()),
+            source_sha256=self._compute_source_sha256(),
+            config=config,
+            config_fingerprint=config_fingerprint,
+        )
+
+    def _load_json_checkpoint_state(self):
+        checkpoint = self._default_checkpoint_state()
+        if not self.resume:
+            self._checkpoint_state = checkpoint
+            return checkpoint
+
+        if not os.path.exists(self.checkpoint_path):
+            self._checkpoint_state = checkpoint
+            return checkpoint
+
+        with open(self.checkpoint_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        loaded = TranslationCheckpoint.from_dict(payload)
+
+        if loaded.source_sha256 != checkpoint.source_sha256:
+            raise ValueError("resume checkpoint does not match the current EPUB file")
+        if loaded.config_fingerprint != checkpoint.config_fingerprint:
+            raise ValueError("resume checkpoint does not match the current translation parameters")
+
+        self._checkpoint_state = loaded
+        return loaded
+
+    def _load_legacy_progress_into_checkpoint(self):
+        if self.accumulated_num > 1 or not os.path.exists(self.bin_path):
+            return
+
+        if self._legacy_state_loaded:
+            return
+
+        try:
+            with open(self.bin_path, "rb") as f:
+                self.p_to_save = pickle.load(f)
+                self._legacy_state_loaded = True
+        except Exception:
+            return
+
+    def _restore_context_pair(self, source_text, translated_text):
+        if not getattr(self.translate_model, "context_flag", False):
+            return
+        save_context = getattr(self.translate_model, "save_context", None)
+        if callable(save_context):
+            save_context(source_text, translated_text)
+
+    def _create_segment(self, item, ordinal, node):
+        if isinstance(node, NavigableString):
+            text = str(node)
+        else:
+            text = self._extract_paragraph(copy(node)).get_text()
+
+        if not text:
+            return None
+        if self._is_special_text(text) or not_trans(text):
+            return None
+
+        return TranslationSegment(
+            segment_id=f"{item.file_name}#{ordinal}",
+            item_file_name=item.file_name,
+            ordinal=ordinal,
+            text=text,
+            node=node,
+        )
+
+    def _build_document_context(self, item, max_segments=None):
+        if self.only_filelist and item.file_name not in self.only_filelist.split(","):
+            return {"item": item, "soup": None, "segments": [], "skip": True}
+        if not self.only_filelist and item.file_name in self.exclude_filelist.split(","):
+            return {"item": item, "soup": None, "segments": [], "skip": True}
+
+        soup = bs(item.content, "html.parser")
+        trans_taglist = self._get_translate_tag_names()
+        p_list = soup.findAll(trans_taglist)
+        p_list = self.filter_nest_list(p_list, trans_taglist)
+
+        if self.allow_navigable_strings:
+            p_list.extend(soup.findAll(text=True))
+
+        if max_segments == 0:
+            return {"item": item, "soup": soup, "segments": [], "skip": False}
+
+        segments = []
+        ordinal = 0
+        for node in p_list:
+            ordinal += 1
+            segment = self._create_segment(item, ordinal, node)
+            if segment is None:
+                continue
+            segments.append(segment)
+            if max_segments is not None and len(segments) >= max_segments:
+                break
+
+        return {"item": item, "soup": soup, "segments": segments, "skip": False}
+
+    def _collect_document_contexts(self):
+        contexts = []
+        remaining = self.test_num if self.is_test else None
+        for item in self.origin_book.get_items_of_type(ITEM_DOCUMENT):
+            max_segments = remaining if remaining is not None else None
+            context = self._build_document_context(item, max_segments=max_segments)
+            contexts.append(context)
+            if remaining is not None and not context["skip"]:
+                remaining -= len(context["segments"])
+                if remaining < 0:
+                    remaining = 0
+        return contexts
+
+    def _iter_segment_batches(self, segments):
+        if self.accumulated_num <= 1:
+            for segment in segments:
+                yield [segment]
+            return
+
+        current_batch = []
+        current_tokens = 0
+        max_segments = 8
+
+        for segment in segments:
+            segment_tokens = num_tokens_from_text(segment.text)
+            if not current_batch:
+                current_batch = [segment]
+                current_tokens = segment_tokens
+                continue
+
+            exceeds_token_limit = current_tokens + segment_tokens > self.accumulated_num
+            exceeds_batch_limit = len(current_batch) >= max_segments
+            if exceeds_token_limit or exceeds_batch_limit:
+                yield current_batch
+                current_batch = [segment]
+                current_tokens = segment_tokens
+            else:
+                current_batch.append(segment)
+                current_tokens += segment_tokens
+
+        if current_batch:
+            yield current_batch
+
+    def _validate_segment_translations(self, segments, translated_segments):
+        if not isinstance(translated_segments, list):
+            raise ValueError("translated segments must be a list")
+
+        expected_ids = [segment.segment_id for segment in segments]
+        seen_ids = set()
+        normalized = {}
+
+        for translated_segment in translated_segments:
+            if not isinstance(translated_segment, dict):
+                raise ValueError("each translated segment must be an object")
+            segment_id = translated_segment.get("id")
+            translation = translated_segment.get("translation")
+            if not isinstance(segment_id, str):
+                raise ValueError("translated segment id must be a string")
+            if segment_id in seen_ids:
+                raise ValueError(f"duplicate translated segment id: {segment_id}")
+            if translation is None:
+                raise ValueError(f"translated segment {segment_id} is missing translation")
+            seen_ids.add(segment_id)
+            normalized[segment_id] = str(translation)
+
+        if set(expected_ids) != set(normalized):
+            raise ValueError("translated segment ids do not match requested segments")
+
+        return {segment.segment_id: normalized[segment.segment_id] for segment in segments}
+
+    def _translate_single_segment(self, segment):
+        translated_text = self.translate_model.translate(segment.text)
+        if translated_text is None:
+            raise RuntimeError(
+                f"segment translation returned None for {segment.segment_id}"
+            )
+        return {segment.segment_id: translated_text}
+
+    def _translate_batch_with_fallback(self, segments, retry_allowed=True):
+        try:
+            translated_segments = self.translate_model.translate_segments(
+                [{"id": segment.segment_id, "text": segment.text} for segment in segments]
+            )
+            return self._validate_segment_translations(segments, translated_segments)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if retry_allowed:
+                return self._translate_batch_with_fallback(segments, retry_allowed=False)
+            if len(segments) == 1:
+                return self._translate_single_segment(segments[0])
+            midpoint = len(segments) // 2
+            left = self._translate_batch_with_fallback(segments[:midpoint], retry_allowed=False)
+            right = self._translate_batch_with_fallback(segments[midpoint:], retry_allowed=False)
+            merged = {}
+            merged.update(left)
+            merged.update(right)
+            return merged
+
+    def _apply_translation_to_segment(self, segment, translated_text):
+        self.helper.insert_trans(
+            segment.node,
+            translated_text,
+            self.translation_style,
+            self.single_translate,
+        )
+
+    def _save_json_checkpoint(self):
+        if self._checkpoint_state is None:
+            return
+
+        target_path = Path(self.checkpoint_path)
+        temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                self._checkpoint_state.to_dict(),
+                f,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        os.replace(temp_path, target_path)
+
+    def _commit_batch(self, batch, batch_translations, pbar):
+        for segment in batch:
+            translated_text = batch_translations[segment.segment_id]
+            self._checkpoint_state.translations[segment.segment_id] = translated_text
+            self._apply_translation_to_segment(segment, translated_text)
+            self._checkpoint_state.completed_count += 1
+            pbar.update(1)
+
+        self._checkpoint_state.committed_batches += 1
+        self._save_json_checkpoint()
+
+    def _replay_saved_translations(self, context, pbar):
+        missing_segments = []
+        for segment in context["segments"]:
+            translated_text = self._checkpoint_state.translations.get(segment.segment_id)
+            if translated_text is None:
+                missing_segments.append(segment)
+                continue
+
+            self._apply_translation_to_segment(segment, translated_text)
+            self._restore_context_pair(segment.text, translated_text)
+            pbar.update(1)
+
+        return missing_segments
+
+    def _process_context_with_checkpoint(self, context, pbar):
+        if context["skip"] or not context["segments"]:
+            return
+
+        missing_segments = self._replay_saved_translations(context, pbar)
+        for batch in self._iter_segment_batches(missing_segments):
+            batch_translations = self._translate_batch_with_fallback(batch)
+            self._commit_batch(batch, batch_translations, pbar)
+
+        if context["soup"] is not None:
+            context["item"].content = context["soup"].encode(encoding="utf-8")
+
+    def _seed_checkpoint_from_legacy_progress(self, contexts):
+        if self._checkpoint_state.translations or not self.p_to_save:
+            return
+
+        translated_iter = iter(self.p_to_save)
+        for context in contexts:
+            for segment in context["segments"]:
+                translated_text = next(translated_iter, None)
+                if translated_text is None:
+                    return
+                self._checkpoint_state.translations[segment.segment_id] = translated_text
+                self._checkpoint_state.completed_count += 1
+
+    def _make_bilingual_book_with_checkpoint(self):
+        self._checkpoint_state = self._load_json_checkpoint_state()
+        contexts = self._collect_document_contexts()
+        self._load_legacy_progress_into_checkpoint()
+        self._seed_checkpoint_from_legacy_progress(contexts)
+
+        new_book = self._make_new_book(self.origin_book)
+        for item in self.origin_book.get_items():
+            if item.get_type() != ITEM_DOCUMENT:
+                new_book.add_item(item)
+
+        total_segments = sum(len(context["segments"]) for context in contexts)
+        pbar = tqdm(total=self.test_num) if self.is_test else tqdm(total=total_segments)
+
+        try:
+            for context in contexts:
+                self._process_context_with_checkpoint(context, pbar)
+                new_book.add_item(context["item"])
+
+            name, _ = os.path.splitext(self.epub_name)
+            epub.write_epub(f"{name}_bilingual.epub", new_book, {})
+            pbar.close()
+        except KeyboardInterrupt as e:
+            print(e)
+            print("you can resume it next time")
+            self._save_json_checkpoint()
+            self._save_temp_book()
+            if total_segments:
+                pbar.close()
+            sys.exit(0)
+        except Exception:
+            traceback.print_exc()
+            self._save_json_checkpoint()
+            self._save_temp_book()
+            if total_segments:
+                pbar.close()
+            sys.exit(0)
+
     def _extract_paragraph(self, p):
-        for p_exclude in self.exclude_translate_tags.split(","):
+        for p_exclude in self._get_exclude_translate_tag_names():
             # for issue #280
             if type(p) is NavigableString:
                 continue
@@ -321,7 +768,7 @@ class EPUBBookLoader(BaseBookLoader):
             print(f"translating {i}/{len(p_list)}")
             temp_p = copy(p)
 
-            for p_exclude in self.exclude_translate_tags.split(","):
+            for p_exclude in self._get_exclude_translate_tag_names():
                 # for issue #280
                 if type(p) is NavigableString:
                     continue
@@ -814,7 +1261,7 @@ class EPUBBookLoader(BaseBookLoader):
             p = p_list[i]
             temp_p = copy(p)
 
-            for p_exclude in self.exclude_translate_tags.split(","):
+            for p_exclude in self._get_exclude_translate_tag_names():
                 if type(p) == NavigableString:
                     continue
                 for pt in temp_p.find_all(p_exclude):
@@ -860,17 +1307,10 @@ class EPUBBookLoader(BaseBookLoader):
                     if time.time() - start_time > 300:  # 5 minutes
                         raise Exception("Batch translation timed out after 5 minutes")
 
-    def make_bilingual_book(self):
-        self.helper = EPUBBookLoaderHelper(
-            self.translate_model,
-            self.accumulated_num,
-            self.translation_style,
-            self.context_flag,
-        )
-        self.batch_init_then_wait()
+    def _make_bilingual_book_legacy(self):
         new_book = self._make_new_book(self.origin_book)
         all_items = list(self.origin_book.get_items())
-        trans_taglist = self.translate_tags.split(",")
+        trans_taglist = self._get_translate_tag_names()
         all_p_length = sum(
             (
                 0
@@ -1011,19 +1451,73 @@ class EPUBBookLoader(BaseBookLoader):
             traceback.print_exc()
             sys.exit(0)
 
+    def make_bilingual_book(self):
+        self.helper = EPUBBookLoaderHelper(
+            self.translate_model,
+            self.accumulated_num,
+            self.translation_style,
+            self.context_flag,
+        )
+        self.batch_init_then_wait()
+
+        if self._should_use_checkpoint_pipeline():
+            if self.parallel_workers > 1:
+                print(
+                    "Checkpoint-based EPUB translation does not support parallel chapter processing yet; falling back to sequential mode."
+                )
+                self.parallel_workers = 1
+                self.enable_parallel = False
+            self._make_bilingual_book_with_checkpoint()
+            return
+
+        if self.resume:
+            self.load_state()
+        self._make_bilingual_book_legacy()
+
     def load_state(self):
+        if self._should_use_checkpoint_pipeline():
+            self._checkpoint_state = self._load_json_checkpoint_state()
+            return
+
         try:
             with open(self.bin_path, "rb") as f:
                 self.p_to_save = pickle.load(f)
+                self._legacy_state_loaded = True
         except Exception:
             raise Exception("can not load resume file")
 
-    def _save_temp_book(self):
-        # TODO refactor this logic
+    def _save_temp_book_with_checkpoint(self):
+        origin_book_temp = epub.read_epub(self.epub_name)
+        new_temp_book = self._make_new_book(origin_book_temp)
+        try:
+            for item in origin_book_temp.get_items():
+                if item.get_type() == ITEM_DOCUMENT:
+                    context = self._build_document_context(item)
+                    if not context["skip"]:
+                        for segment in context["segments"]:
+                            translated_text = self._checkpoint_state.translations.get(
+                                segment.segment_id
+                            )
+                            if translated_text is not None:
+                                self.helper.insert_trans(
+                                    segment.node,
+                                    translated_text,
+                                    self.translation_style,
+                                    self.single_translate,
+                                )
+                        if context["soup"] is not None:
+                            item.content = context["soup"].encode(encoding="utf-8")
+                new_temp_book.add_item(item)
+            name, _ = os.path.splitext(self.epub_name)
+            epub.write_epub(f"{name}_bilingual_temp.epub", new_temp_book, {})
+        except Exception as e:
+            print(e)
+
+    def _save_temp_book_legacy(self):
         origin_book_temp = epub.read_epub(self.epub_name)
         new_temp_book = self._make_new_book(origin_book_temp)
         p_to_save_len = len(self.p_to_save)
-        trans_taglist = self.translate_tags.split(",")
+        trans_taglist = self._get_translate_tag_names()
         index = 0
         try:
             for item in origin_book_temp.get_items():
@@ -1036,8 +1530,6 @@ class EPUBBookLoader(BaseBookLoader):
                     for p in p_list:
                         if not p.text or self._is_special_text(p.text):
                             continue
-                        # TODO banch of p to translate then combine
-                        # PR welcome here
                         if index < p_to_save_len:
                             new_p = copy(p)
                             if type(p) is NavigableString:
@@ -1053,17 +1545,28 @@ class EPUBBookLoader(BaseBookLoader):
                             index += 1
                         else:
                             break
-                    # for save temp book
                     if soup:
                         item.content = soup.encode()
                 new_temp_book.add_item(item)
             name, _ = os.path.splitext(self.epub_name)
             epub.write_epub(f"{name}_bilingual_temp.epub", new_temp_book, {})
         except Exception as e:
-            # TODO handle it
             print(e)
 
+    def _save_temp_book(self):
+        if self._should_use_checkpoint_pipeline():
+            if self._checkpoint_state is None:
+                self._checkpoint_state = self._default_checkpoint_state()
+            self._save_temp_book_with_checkpoint()
+            return
+
+        self._save_temp_book_legacy()
+
     def _save_progress(self):
+        if self._should_use_checkpoint_pipeline():
+            self._save_json_checkpoint()
+            return
+
         try:
             with open(self.bin_path, "wb") as f:
                 pickle.dump(self.p_to_save, f)

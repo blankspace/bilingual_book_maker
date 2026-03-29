@@ -108,3 +108,28 @@ class Claude(Base):
 
         print("[bold green]" + re.sub("\n{3,}", "\n\n", t_text) + "[/bold green]")
         return t_text
+
+    def translate_segments(self, segments):
+        prompt = self.build_segment_translation_prompt(segments, self.prompt_template)
+        self.rotate_key()
+
+        messages = self.create_messages(prompt, self.create_context_messages())
+        response = self.client.messages.create(
+            max_tokens=4096,
+            messages=messages,
+            system=self.prompt_sys_msg,
+            temperature=self.temperature,
+            model=self.model,
+        )
+        content = response.content[0].text if response.content else ""
+        parsed = self.parse_segment_translation_response(content)
+
+        if self.context_flag:
+            self.save_context(
+                "\n\n".join(segment["text"] for segment in segments),
+                "\n\n".join(
+                    item.get("translation", "") for item in parsed if isinstance(item, dict)
+                ),
+            )
+
+        return parsed

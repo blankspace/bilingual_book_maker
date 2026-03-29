@@ -175,6 +175,48 @@ class Gemini(Base):
             t_text = str(num) + "\n" + t_text
         return t_text
 
+    def translate_segments(self, segments):
+        prompt = self.build_segment_translation_prompt(segments, self.prompt)
+        delay = 1
+        exponential_base = 2
+        attempt_count = 0
+        max_attempts = 7
+        response_text = ""
+
+        while attempt_count < max_attempts:
+            try:
+                self.convo.send_message(prompt)
+                response_text = self.convo.last.text.strip()
+                break
+            except StopCandidateException as e:
+                print(
+                    f"Segment translation failed due to StopCandidateException: {e} Attempting to switch model..."
+                )
+                self.rotate_model()
+            except BlockedPromptException as e:
+                print(
+                    f"Segment translation failed due to BlockedPromptException: {e} Attempting to switch model..."
+                )
+                self.rotate_model()
+            except Exception as e:
+                print(
+                    f"Segment translation failed due to {type(e).__name__}: {e} Will sleep {delay} seconds"
+                )
+                time.sleep(delay)
+                delay *= exponential_base
+                self.rotate_key()
+                if attempt_count >= 1:
+                    self.rotate_model()
+            attempt_count += 1
+
+        if attempt_count == max_attempts:
+            raise RuntimeError(
+                f"Segment translation failed after {max_attempts} attempts."
+            )
+
+        time.sleep(self.interval)
+        return self.parse_segment_translation_response(response_text)
+
     def set_interval(self, interval):
         self.interval = interval
 

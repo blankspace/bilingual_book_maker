@@ -4,6 +4,7 @@ import os
 from os import environ as env
 
 from book_maker.loader import BOOK_LOADER_DICT
+from book_maker.loader.epub_loader import DEFAULT_TRANSLATE_TAGS
 from book_maker.translator import MODEL_DICT
 from book_maker.utils import LANGUAGES, TO_LANGUAGE_CODE
 
@@ -278,8 +279,8 @@ def main():
         "--translate-tags",
         dest="translate_tags",
         type=str,
-        default="p",
-        help="example --translate-tags p,blockquote",
+        default=DEFAULT_TRANSLATE_TAGS,
+        help="example --translate-tags p,blockquote; default for EPUB is auto, which translates common visible text blocks",
     )
     parser.add_argument(
         "--exclude_translate-tags",
@@ -638,6 +639,7 @@ So you are close to reaching the limit. You have to choose your own value, there
     if options.model == "geminipro":
         e.translate_model.set_geminipro_models()
 
+    e.selected_model_name = options.model
     e.make_bilingual_book()
 
 

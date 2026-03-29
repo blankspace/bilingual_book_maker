@@ -226,6 +226,28 @@ class QwenTranslator(Base):
 
         return t_text
 
+    def translate_segments(self, segments):
+        prompt = self.build_segment_translation_prompt(segments)
+        self.rotate_key()
+
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            extra_body={"translation_options": self._create_translation_options()},
+        )
+        content = completion.choices[0].message.content or ""
+        parsed = self.parse_segment_translation_response(content)
+
+        if self.context_flag:
+            self.save_context(
+                "\n\n".join(segment["text"] for segment in segments),
+                "\n\n".join(
+                    item.get("translation", "") for item in parsed if isinstance(item, dict)
+                ),
+            )
+
+        return parsed
+
     def set_terminology(self, terminology):
         """Set custom terminology for translation
 
