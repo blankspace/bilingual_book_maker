@@ -29,6 +29,9 @@ DEFAULT_TRANSLATE_TAGS = "auto"
 AUTO_TRANSLATE_TAGS = (
     "p",
     "div",
+    "aside",
+    "section",
+    "article",
     "li",
     "blockquote",
     "h1",
@@ -54,6 +57,7 @@ class TranslationSegment:
     ordinal: int
     text: str
     node: Any
+    replace_target: bool = False
 
 
 @dataclass
@@ -396,7 +400,44 @@ class EPUBBookLoader(BaseBookLoader):
         if callable(save_context):
             save_context(source_text, translated_text)
 
-    def _create_segment(self, item, ordinal, node):
+    def _get_filtered_translatable_tags(self, root, trans_taglist):
+        return self.filter_nest_list(root.findAll(trans_taglist), trans_taglist)
+
+    def _build_table_translation_target_map(self, table, trans_taglist):
+        translation_table = copy(table)
+        table.insert_after(translation_table)
+
+        source_nodes = self._get_filtered_translatable_tags(table, trans_taglist)
+        target_nodes = self._get_filtered_translatable_tags(
+            translation_table, trans_taglist
+        )
+        if len(source_nodes) != len(target_nodes):
+            return {}
+
+        return {id(source): target for source, target in zip(source_nodes, target_nodes)}
+
+    def _resolve_translation_target(self, node, trans_taglist, table_target_maps):
+        if not isinstance(node, Tag):
+            return node, False
+
+        table = node.find_parent("table")
+        if table is None:
+            return node, False
+
+        table_key = id(table)
+        if table_key not in table_target_maps:
+            table_target_maps[table_key] = self._build_table_translation_target_map(
+                table, trans_taglist
+            )
+
+        target_node = table_target_maps[table_key].get(id(node))
+        if target_node is None:
+            return node, False
+        return target_node, True
+
+    def _create_segment(
+        self, item, ordinal, node, target_node=None, replace_target=False
+    ):
         if isinstance(node, NavigableString):
             text = str(node)
         else:
@@ -412,7 +453,8 @@ class EPUBBookLoader(BaseBookLoader):
             item_file_name=item.file_name,
             ordinal=ordinal,
             text=text,
-            node=node,
+            node=target_node or node,
+            replace_target=replace_target,
         )
 
     def _build_document_context(self, item, max_segments=None):
@@ -434,9 +476,19 @@ class EPUBBookLoader(BaseBookLoader):
 
         segments = []
         ordinal = 0
+        table_target_maps = {}
         for node in p_list:
             ordinal += 1
-            segment = self._create_segment(item, ordinal, node)
+            target_node, replace_target = self._resolve_translation_target(
+                node, trans_taglist, table_target_maps
+            )
+            segment = self._create_segment(
+                item,
+                ordinal,
+                node,
+                target_node=target_node,
+                replace_target=replace_target,
+            )
             if segment is None:
                 continue
             segments.append(segment)
@@ -544,7 +596,23 @@ class EPUBBookLoader(BaseBookLoader):
             merged.update(right)
             return merged
 
+    @staticmethod
+    def _replace_translation_target(node, translated_text):
+        if translated_text is None:
+            translated_text = ""
+
+        if isinstance(node, NavigableString):
+            node.replace_with(NavigableString(translated_text))
+            return
+
+        node.clear()
+        node.append(NavigableString(translated_text))
+
     def _apply_translation_to_segment(self, segment, translated_text):
+        if segment.replace_target:
+            self._replace_translation_target(segment.node, translated_text)
+            return
+
         self.helper.insert_trans(
             segment.node,
             translated_text,
@@ -1499,11 +1567,8 @@ class EPUBBookLoader(BaseBookLoader):
                                 segment.segment_id
                             )
                             if translated_text is not None:
-                                self.helper.insert_trans(
-                                    segment.node,
-                                    translated_text,
-                                    self.translation_style,
-                                    self.single_translate,
+                                self._apply_translation_to_segment(
+                                    segment, translated_text
                                 )
                         if context["soup"] is not None:
                             item.content = context["soup"].encode(encoding="utf-8")

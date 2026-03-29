@@ -53,6 +53,30 @@ def _read_tag_texts(epub_path, tag_names):
     return [node.get_text() for node in soup.find_all(tag_names)]
 
 
+def _read_tables(epub_path):
+    book = epub.read_epub(str(epub_path))
+    document = next(book.get_items_of_type(ITEM_DOCUMENT))
+    soup = bs(document.content, "html.parser")
+    tables = []
+    for table in soup.find_all("table"):
+        caption = table.find("caption")
+        rows = []
+        for row in table.find_all("tr"):
+            rows.append(
+                [
+                    cell.get_text(" ", strip=True)
+                    for cell in row.find_all(["th", "td"], recursive=False)
+                ]
+            )
+        tables.append(
+            {
+                "caption": None if caption is None else caption.get_text(" ", strip=True),
+                "rows": rows,
+            }
+        )
+    return tables
+
+
 class BatchEchoModel:
     batch_calls = 0
     single_calls = 0
@@ -232,6 +256,78 @@ def test_epub_default_translate_tags_cover_headings_and_list_items(tmp_path):
         "ZH::Are the interests of the average outside shareholder receiving proper recognition?",
         "Body paragraph.",
         "ZH::Body paragraph.",
+    ]
+
+
+def test_epub_default_translate_tags_cover_aside_footnotes(tmp_path):
+    epub_path = tmp_path / "footnotes.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<h2>Notes</h2>"
+        "<aside epub:type='footnote' id='ft_1'><a href='#ref_1'><sup>1</sup></a> "
+        "An apparent reference to the maxim.</aside>"
+        "<aside epub:type='footnote' id='ft_2'><a href='#ref_2'><sup>2</sup></a> "
+        "The bond yield represents a portfolio.</aside>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    output_path = tmp_path / "footnotes_bilingual.epub"
+    assert output_path.exists()
+    assert _read_tag_texts(output_path, ["h2", "aside"]) == [
+        "Notes",
+        "ZH::Notes",
+        "1 An apparent reference to the maxim.",
+        "ZH:: An apparent reference to the maxim.",
+        "2 The bond yield represents a portfolio.",
+        "ZH:: The bond yield represents a portfolio.",
+    ]
+
+
+def test_epub_tables_are_rendered_as_separate_translated_tables(tmp_path):
+    epub_path = tmp_path / "tables.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<table class='funds'>"
+        "<caption>Portfolio Impact</caption>"
+        "<tr><th>Stocks</th><th>Bonds</th></tr>"
+        "<tr><td>75%</td><td>25%</td></tr>"
+        "</table>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    output_path = tmp_path / "tables_bilingual.epub"
+    assert output_path.exists()
+    assert _read_tables(output_path) == [
+        {
+            "caption": "Portfolio Impact",
+            "rows": [["Stocks", "Bonds"], ["75%", "25%"]],
+        },
+        {
+            "caption": "ZH::Portfolio Impact",
+            "rows": [["ZH::Stocks", "ZH::Bonds"], ["ZH::75%", "ZH::25%"]],
+        },
     ]
 
 
