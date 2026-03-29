@@ -4,9 +4,10 @@ import os
 from os import environ as env
 
 from book_maker.loader import BOOK_LOADER_DICT
-from book_maker.loader.epub_loader import DEFAULT_TRANSLATE_TAGS
 from book_maker.translator import MODEL_DICT
 from book_maker.utils import LANGUAGES, TO_LANGUAGE_CODE
+
+DEFAULT_TRANSLATE_TAGS = "auto"
 
 
 def parse_prompt_arg(prompt_arg):

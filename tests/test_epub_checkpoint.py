@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from bs4 import BeautifulSoup as bs
 from ebooklib import ITEM_DOCUMENT, epub
@@ -332,6 +331,32 @@ def test_epub_tables_are_rendered_as_separate_translated_tables(tmp_path):
             "rows": [["ZH::Stocks", "ZH::Bonds"], ["ZH::75%", "ZH::25%"]],
         },
     ]
+
+
+def test_epub_non_translatable_tables_are_not_duplicated(tmp_path):
+    epub_path = tmp_path / "numbers.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<table><tr><td>1</td><td>2</td></tr></table>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    output_path = tmp_path / "numbers_bilingual.epub"
+    assert output_path.exists()
+    assert BatchEchoModel.batch_calls == 0
+    assert BatchEchoModel.single_calls == 0
+    assert _read_tables(output_path) == [{"caption": None, "rows": [["1", "2"]]}]
 
 
 def test_epub_invalid_batch_response_falls_back_without_missing_segments(tmp_path):

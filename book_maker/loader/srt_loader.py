@@ -61,7 +61,7 @@ class SRTBookLoader(BaseBookLoader):
         pass
 
     def _parse_srt(self, srt_text):
-        blocks = re.split("\n\s*\n", srt_text)
+        blocks = re.split(r"\n\s*\n", srt_text)
 
         final_blocks = []
         new_block = {}

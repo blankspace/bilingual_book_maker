@@ -1,4 +1,7 @@
+import sys
+
 import tiktoken
+from rich import print as rich_print
 
 # Borrowed from : https://github.com/openai/whisper
 LANGUAGES = {
@@ -129,6 +132,22 @@ def prompt_config_to_kwargs(prompt_config):
         prompt_template=prompt_config.get("user", None),
         prompt_sys_msg=prompt_config.get("system", None),
     )
+
+
+def safe_rich_print(*objects, **kwargs):
+    try:
+        rich_print(*objects, **kwargs)
+    except UnicodeEncodeError:
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        text = sep.join(str(obj) for obj in objects)
+        safe_text = text.encode(encoding, errors="replace").decode(
+            encoding, errors="replace"
+        )
+        sys.stdout.write(safe_text)
+        if end:
+            sys.stdout.write(end)
 
 
 # ref: https://platform.openai.com/docs/guides/chat/introduction

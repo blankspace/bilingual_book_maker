@@ -1,9 +1,10 @@
 import re
 import requests
-from rich import print
 
-from book_maker.utils import TO_LANGUAGE_CODE
+from book_maker.utils import TO_LANGUAGE_CODE, safe_rich_print
 from .base_translator import Base
+
+print = safe_rich_print
 
 
 class Google(Base):

@@ -403,7 +403,7 @@ class EPUBBookLoader(BaseBookLoader):
             save_context(source_text, translated_text)
 
     def _get_filtered_translatable_tags(self, root, trans_taglist):
-        return self.filter_nest_list(root.findAll(trans_taglist), trans_taglist)
+        return self.filter_nest_list(root.find_all(trans_taglist), trans_taglist)
 
     def _build_table_translation_target_map(self, table, trans_taglist):
         translation_table = copy(table)
@@ -467,11 +467,11 @@ class EPUBBookLoader(BaseBookLoader):
 
         soup = bs(item.content, "html.parser")
         trans_taglist = self._get_translate_tag_names()
-        p_list = soup.findAll(trans_taglist)
+        p_list = soup.find_all(trans_taglist)
         p_list = self.filter_nest_list(p_list, trans_taglist)
 
         if self.allow_navigable_strings:
-            p_list.extend(soup.findAll(text=True))
+            p_list.extend(soup.find_all(string=True))
 
         if max_segments == 0:
             return {"item": item, "soup": soup, "segments": [], "skip": False}
@@ -481,18 +481,17 @@ class EPUBBookLoader(BaseBookLoader):
         table_target_maps = {}
         for node in p_list:
             ordinal += 1
+            segment = self._create_segment(item, ordinal, node)
+            if segment is None:
+                continue
+
             target_node, replace_target = self._resolve_translation_target(
                 node, trans_taglist, table_target_maps
             )
-            segment = self._create_segment(
-                item,
-                ordinal,
-                node,
-                target_node=target_node,
-                replace_target=replace_target,
-            )
-            if segment is None:
-                continue
+            if replace_target:
+                segment.node = target_node
+                segment.replace_target = True
+
             segments.append(segment)
             if max_segments is not None and len(segments) >= max_segments:
                 break
@@ -920,8 +919,8 @@ class EPUBBookLoader(BaseBookLoader):
         soup_complete = bs(content_complete, "html.parser")
         soup_ori = bs(content_ori, "html.parser")
 
-        p_list_complete = soup_complete.findAll(trans_taglist)
-        p_list_ori = soup_ori.findAll(trans_taglist)
+        p_list_complete = soup_complete.find_all(trans_taglist)
+        p_list_ori = soup_ori.find_all(trans_taglist)
 
         target = None
         tagl = []
@@ -1019,7 +1018,7 @@ class EPUBBookLoader(BaseBookLoader):
 
         content = item.content
         soup = bs(content, "html.parser")
-        p_list = soup.findAll(trans_taglist)
+        p_list = soup.find_all(trans_taglist)
 
         p_list = self.filter_nest_list(p_list, trans_taglist)
 
@@ -1040,7 +1039,7 @@ class EPUBBookLoader(BaseBookLoader):
                     break
 
         if self.allow_navigable_strings:
-            p_list.extend(soup.findAll(text=True))
+            p_list.extend(soup.find_all(string=True))
 
         send_num = self.accumulated_num
         if send_num > 1:
@@ -1135,11 +1134,11 @@ class EPUBBookLoader(BaseBookLoader):
 
             content = item.content
             soup = bs(content, "html.parser")
-            p_list = soup.findAll(trans_taglist)
+            p_list = soup.find_all(trans_taglist)
             p_list = self.filter_nest_list(p_list, trans_taglist)
 
             if self.allow_navigable_strings:
-                p_list.extend(soup.findAll(text=True))
+                p_list.extend(soup.find_all(string=True))
 
             # Initialize chapter-specific context lists
             chapter_context_list = []
@@ -1392,7 +1391,7 @@ class EPUBBookLoader(BaseBookLoader):
                         and i.file_name not in self.only_filelist.split(",")
                     )
                 )
-                else len(bs(i.content, "html.parser").findAll(trans_taglist))
+                else len(bs(i.content, "html.parser").find_all(trans_taglist))
             )
             for i in all_items
         )
@@ -1407,7 +1406,7 @@ class EPUBBookLoader(BaseBookLoader):
                         and i.file_name not in self.only_filelist.split(",")
                     )
                 )
-                else len(bs(i.content, "html.parser").findAll(text=True))
+                else len(bs(i.content, "html.parser").find_all(string=True))
             )
             for i in all_items
         )
@@ -1591,9 +1590,9 @@ class EPUBBookLoader(BaseBookLoader):
                 if item.get_type() == ITEM_DOCUMENT:
                     content = item.content
                     soup = bs(content, "html.parser")
-                    p_list = soup.findAll(trans_taglist)
+                    p_list = soup.find_all(trans_taglist)
                     if self.allow_navigable_strings:
-                        p_list.extend(soup.findAll(text=True))
+                        p_list.extend(soup.find_all(string=True))
                     for p in p_list:
                         if not p.text or self._is_special_text(p.text):
                             continue
