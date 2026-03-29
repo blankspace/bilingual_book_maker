@@ -29,6 +29,9 @@ DEFAULT_TRANSLATE_TAGS = "auto"
 AUTO_TRANSLATE_TAGS = (
     "p",
     "div",
+    "aside",
+    "section",
+    "article",
     "li",
     "blockquote",
     "h1",

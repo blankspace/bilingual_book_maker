@@ -235,6 +235,41 @@ def test_epub_default_translate_tags_cover_headings_and_list_items(tmp_path):
     ]
 
 
+def test_epub_default_translate_tags_cover_aside_footnotes(tmp_path):
+    epub_path = tmp_path / "footnotes.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<h2>Notes</h2>"
+        "<aside epub:type='footnote' id='ft_1'><a href='#ref_1'><sup>1</sup></a> "
+        "An apparent reference to the maxim.</aside>"
+        "<aside epub:type='footnote' id='ft_2'><a href='#ref_2'><sup>2</sup></a> "
+        "The bond yield represents a portfolio.</aside>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    output_path = tmp_path / "footnotes_bilingual.epub"
+    assert output_path.exists()
+    assert _read_tag_texts(output_path, ["h2", "aside"]) == [
+        "Notes",
+        "ZH::Notes",
+        "1 An apparent reference to the maxim.",
+        "ZH:: An apparent reference to the maxim.",
+        "2 The bond yield represents a portfolio.",
+        "ZH:: The bond yield represents a portfolio.",
+    ]
+
+
 def test_epub_invalid_batch_response_falls_back_without_missing_segments(tmp_path):
     epub_path = tmp_path / "fallback.epub"
     _create_epub(epub_path, ["Alpha", "Beta"])
