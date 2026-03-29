@@ -235,6 +235,30 @@ class ChatGPTAPI(Base):
 
         return t_text
 
+    def translate_segments(self, segments):
+        prompt = self.build_segment_translation_prompt(segments, self.prompt_template)
+        self.rotate_key()
+        self.rotate_model()
+
+        messages = self.create_messages(prompt, self.create_context_messages())
+        completion = self.openai_client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            extra_body=self.extra_body if self.extra_body else None,
+        )
+        content = completion.choices[0].message.content or ""
+        parsed = self.parse_segment_translation_response(content)
+
+        if self.context_flag:
+            source_text = "\n\n".join(segment["text"] for segment in segments)
+            translated_text = "\n\n".join(
+                item.get("translation", "") for item in parsed if isinstance(item, dict)
+            )
+            self.save_context(source_text, translated_text)
+
+        return parsed
+
     def translate_and_split_lines(self, text):
         result_str = self.translate(text, False)
         lines = result_str.splitlines()

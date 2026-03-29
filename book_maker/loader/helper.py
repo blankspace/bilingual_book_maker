@@ -3,6 +3,8 @@ import backoff
 import logging
 from copy import copy
 
+from bs4.element import NavigableString
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,12 @@ class EPUBBookLoaderHelper:
     def insert_trans(self, p, text, translation_style="", single_translate=False):
         if text is None:
             text = ""
+        if isinstance(p, NavigableString):
+            new_p = NavigableString(text)
+            p.insert_after(new_p)
+            if single_translate:
+                p.extract()
+            return
         if (
             p.string is not None
             and p.string.replace(" ", "").strip() == text.replace(" ", "").strip()

@@ -141,7 +141,7 @@ bbook --book_name test_books/animal_farm.epub --openai_key ${openai_key} --test
 
 - `--translate-tags`
 
-  指定需要翻译的标签，使用逗号分隔多个标签。epub 由 html 文件组成，默认情况下，只翻译 `<p>` 中的内容。例如: `--translate-tags h1,h2,h3,p,div`
+  指定需要翻译的标签，使用逗号分隔多个标签。epub 由 html 文件组成，默认情况下使用 `auto`，会自动翻译常见可见文本块，例如 `<p>`、标题标签（`<h1>`-`<h6>`）、`<li>`、`<blockquote>`、`<div>`、caption 以及表格单元格等内容。例如: `--translate-tags h1,h2,h3,p,div`
 
 - `--book_from`
 
