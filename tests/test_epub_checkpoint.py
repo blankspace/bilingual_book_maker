@@ -178,8 +178,11 @@ def test_epub_segment_ids_are_stable_and_checkpoint_roundtrip_preserves_newlines
         for context in loader._collect_document_contexts()
         for segment in context["segments"]
     ]
+    runtime_config, _ = loader._build_runtime_config()
 
     assert first_ids == second_ids == ["chapter.xhtml#1", "chapter.xhtml#2"]
+    assert "aside" in runtime_config["translate_tags"]
+    assert "sup" in runtime_config["exclude_translate_tags"]
 
     loader._checkpoint_state = loader._default_checkpoint_state()
     loader._checkpoint_state.translations[first_ids[0]] = "line 1\nline 2"
