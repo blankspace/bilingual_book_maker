@@ -11,7 +11,7 @@ from threading import Lock
 from openai import AzureOpenAI, OpenAI, RateLimitError
 from rich import print
 
-from .base_translator import Base
+from .base_translator import Base, BATCH_DELIMITER
 from ..config import config
 
 CHATGPT_CONFIG = config["translator"]["chatgptapi"]
@@ -205,6 +205,7 @@ class ChatGPTAPI(Base):
         attempt_count = 0
         max_attempts = 3
         t_text = ""
+        last_exception = None
 
         while attempt_count < max_attempts:
             try:
@@ -223,8 +224,12 @@ class ChatGPTAPI(Base):
                     print(f"Get {attempt_count} consecutive exceptions")
                     raise
             except Exception as e:
+                last_exception = e
                 print(str(e))
-                return
+                attempt_count += 1
+                if attempt_count == max_attempts:
+                    print(f"Get {attempt_count} consecutive exceptions, raising error")
+                    raise e
 
         # todo: Determine whether to print according to the cli option
         if needprint:
@@ -333,105 +338,80 @@ class ChatGPTAPI(Base):
 
         return new_text
 
-    def translate_list(self, plist):
-        plist_len = len(plist)
+    def translate_list(self, text_list):
+        """
+        Translate multiple texts in a single batch request using delimiters.
+        Returns a list of translated texts.
+        """
+        plist_len = len(text_list)
 
-        # Create a list of original texts and add clear numbering markers to each paragraph
-        formatted_text = ""
-        for i, p in enumerate(plist, 1):
-            temp_p = copy(p)
-            for sup in temp_p.find_all("sup"):
-                sup.extract()
-            para_text = temp_p.get_text().strip()
-            # Using special delimiters and clear numbering
-            formatted_text += f"PARAGRAPH {i}:\n{para_text}\n\n"
+        if plist_len == 0:
+            return []
 
-        print(f"plist len = {plist_len}")
+        if plist_len == 1:
+            return [self.translate(str(text_list[0]).strip(), False)]
 
-        original_prompt_template = self.prompt_template
+        # Join with delimiter
+        batch_text = BATCH_DELIMITER.join(str(t).strip() for t in text_list)
 
-        structured_prompt = (
-            f"Translate the following {plist_len} paragraphs to {{language}}. "
-            f"CRUCIAL INSTRUCTION: Format your response using EXACTLY this structure:\n\n"
-            f"TRANSLATION OF PARAGRAPH 1:\n[Your translation of paragraph 1 here]\n\n"
-            f"TRANSLATION OF PARAGRAPH 2:\n[Your translation of paragraph 2 here]\n\n"
-            f"... and so on for all {plist_len} paragraphs.\n\n"
-            f"You MUST provide EXACTLY {plist_len} translated paragraphs. "
-            f"Do not merge, split, or rearrange paragraphs. "
-            f"Translate each paragraph independently but consistently. "
-            f"Keep all numbers and special formatting in your translation. "
-            f"Each original paragraph must correspond to exactly one translated paragraph."
+        original_prompt = self.prompt_template
+        original_sys_msg = self.system_content
+
+        # Build batch prompt that respects the user's custom prompt
+        # Add batch-specific instructions while preserving the original prompt structure
+        batch_instruction = (
+            f"Translate the following {plist_len} text segments to {{language}}. "
+            f"Separate each translation with '{BATCH_DELIMITER}'. "
+            f"Output EXACTLY {plist_len} translations.\n\n"
         )
 
-        self.prompt_template = structured_prompt + " ```{text}```"
+        # Use the user's custom prompt template, or fall back to default if not set
+        user_prompt = original_prompt if original_prompt else self.DEFAULT_PROMPT
+        batch_prompt = batch_instruction + user_prompt
 
-        translated_text = self.translate(formatted_text, False)
-
-        # Extract translations from structured output
-        translated_paragraphs = []
-        for i in range(1, plist_len + 1):
-            pattern = (
-                r"TRANSLATION OF PARAGRAPH "
-                + str(i)
-                + r":(.*?)(?=TRANSLATION OF PARAGRAPH \d+:|\Z)"
+        # Preserve user's system message, adding batch-specific context if needed
+        if original_sys_msg:
+            batch_sys_msg = (
+                f"{original_sys_msg} Input has {plist_len} segments separated by '{BATCH_DELIMITER}'. "
+                f"Output {plist_len} translations with '{BATCH_DELIMITER}' between each."
             )
-            matches = re.findall(pattern, translated_text, re.DOTALL)
+        else:
+            batch_sys_msg = (
+                f"Professional translator. Input has {plist_len} segments separated by '{BATCH_DELIMITER}'. "
+                f"Output {plist_len} translations with '{BATCH_DELIMITER}' between each."
+            )
 
-            if matches:
-                translated_paragraph = matches[0].strip()
-                translated_paragraphs.append(translated_paragraph)
-            else:
-                print(f"Warning: Could not find translation for paragraph {i}")
-                loose_pattern = (
-                    r"(?:TRANSLATION|PARAGRAPH|PARA).*?"
-                    + str(i)
-                    + r".*?:(.*?)(?=(?:TRANSLATION|PARAGRAPH|PARA).*?\d+.*?:|\Z)"
-                )
-                loose_matches = re.findall(loose_pattern, translated_text, re.DOTALL)
-                if loose_matches:
-                    translated_paragraphs.append(loose_matches[0].strip())
-                else:
-                    translated_paragraphs.append("")
+        try:
+            self.prompt_template = batch_prompt
+            self.system_content = batch_sys_msg
+            translated_text = self.translate(batch_text, False)
+        finally:
+            self.prompt_template = original_prompt
+            self.system_content = original_sys_msg
 
-        self.prompt_template = original_prompt_template
+        # Handle None or empty response from translate
+        if not translated_text:
+            print(
+                f"[bold red]Error: Translation API returned empty response for batch request.[/bold red]"
+            )
+            raise Exception("Translation API returned empty response")
 
-        # If the number of extracted paragraphs is incorrect, try the alternative extraction method.
+        translated_paragraphs = self.extract_paragraphs(translated_text, plist_len)
+
         if len(translated_paragraphs) != plist_len:
             print(
-                f"Warning: Extracted {len(translated_paragraphs)}/{plist_len} paragraphs. Using fallback extraction."
+                f"Warning: Expected {plist_len} translations, got {len(translated_paragraphs)}. Falling back to one-by-one translation."
             )
-
-            all_para_pattern = r"(?:TRANSLATION|PARAGRAPH|PARA).*?(\d+).*?:(.*?)(?=(?:TRANSLATION|PARAGRAPH|PARA).*?\d+.*?:|\Z)"
-            all_matches = re.findall(all_para_pattern, translated_text, re.DOTALL)
-
-            if all_matches:
-                # Create a dictionary to map translation content based on paragraph numbers
-                para_dict = {}
-                for num_str, content in all_matches:
-                    try:
-                        num = int(num_str)
-                        if 1 <= num <= plist_len:
-                            para_dict[num] = content.strip()
-                    except ValueError:
-                        continue
-
-                # Rebuild the translation list in the original order
-                new_translated_paragraphs = []
-                for i in range(1, plist_len + 1):
-                    if i in para_dict:
-                        new_translated_paragraphs.append(para_dict[i])
-                    else:
-                        new_translated_paragraphs.append("")
-
-                if len(new_translated_paragraphs) == plist_len:
-                    translated_paragraphs = new_translated_paragraphs
-
-        if len(translated_paragraphs) < plist_len:
-            translated_paragraphs.extend(
-                [""] * (plist_len - len(translated_paragraphs))
-            )
-        elif len(translated_paragraphs) > plist_len:
-            translated_paragraphs = translated_paragraphs[:plist_len]
+            print(f"\n[Debug] Input text_list ({plist_len} items):")
+            for i, t in enumerate(text_list, 1):
+                print(f"  [{i}] {str(t).strip()!r}")
+            print(f"\n[Debug] Model response ({len(translated_text)} chars):")
+            print(translated_text)
+            print(f"\n[Debug] Split result ({len(translated_paragraphs)} items):")
+            for i, p in enumerate(translated_paragraphs, 1):
+                print(f"  [{i}] {p!r}")
+            print()
+            return [self.translate(str(t).strip(), False) for t in text_list]
 
         return translated_paragraphs
 
@@ -454,7 +434,35 @@ class ChatGPTAPI(Base):
                 matches.sort(key=lambda x: int(x[0]))
                 result_list = [match[1].strip() for match in matches]
 
-        # Fallback to original line-splitting approach
+        # Fallback: try splitting by BATCH_DELIMITER with flexible whitespace
+        if len(result_list) != paragraph_count:
+            # Extract the core delimiter (e.g., '@@' from BATCH_DELIMITER)
+            core_delimiter = BATCH_DELIMITER.strip()
+            # First try exact split by the delimiter
+            parts = text.split(BATCH_DELIMITER)
+            # If that doesn't work well, try splitting by variations
+            if len(parts) < paragraph_count:
+                # Try splitting by the core delimiter with flexible surrounding
+                # whitespace/newlines and filter out lines that are only the delimiter
+                lines = text.splitlines()
+                parts = []
+                current = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped == core_delimiter or re.fullmatch(
+                        r"\s*" + re.escape(core_delimiter) + r"\s*", stripped
+                    ):
+                        if current:
+                            parts.append("\n".join(current).strip())
+                            current = []
+                    else:
+                        current.append(line)
+                if current:
+                    parts.append("\n".join(current).strip())
+            # Filter out empty strings
+            result_list = [p.strip() for p in parts if p.strip()]
+
+        # Final fallback: split by double newlines if still not matching
         if len(result_list) != paragraph_count:
             lines = text.splitlines()
             result_list = [line.strip() for line in lines if line.strip() != ""]
