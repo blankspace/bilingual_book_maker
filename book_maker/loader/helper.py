@@ -3,6 +3,7 @@ import backoff
 import logging
 from copy import copy
 
+from bs4 import Tag
 from bs4.element import NavigableString
 
 logging.basicConfig(level=logging.WARNING)
@@ -17,6 +18,71 @@ class EPUBBookLoaderHelper:
         self.accumulated_num = accumulated_num
         self.translation_style = translation_style
         self.context_flag = context_flag
+
+    @staticmethod
+    def _normalize_epub_types(tag):
+        epub_type = tag.attrs.get("epub:type")
+        if epub_type is None:
+            return set()
+        if isinstance(epub_type, str):
+            return {value for value in epub_type.split() if value}
+        if isinstance(epub_type, (list, tuple, set)):
+            values = set()
+            for item in epub_type:
+                values.update(str(item).split())
+            return values
+        return {str(epub_type)}
+
+    @classmethod
+    def _is_note_like_tag(cls, tag):
+        if not isinstance(tag, Tag):
+            return False
+
+        classes = set(tag.get("class", []))
+        epub_types = cls._normalize_epub_types(tag)
+        return bool(
+            {"noteEntry", "footnotetext"} & classes
+            or {"rearnote", "rearnotes", "footnote"} & epub_types
+        )
+
+    @staticmethod
+    def _append_style(tag, extra_style):
+        if not extra_style:
+            return
+
+        existing_style = tag.get("style", "").strip()
+        if existing_style and not existing_style.endswith(";"):
+            existing_style = f"{existing_style};"
+        extra_style = extra_style.strip()
+        if extra_style and not extra_style.endswith(";"):
+            extra_style = f"{extra_style};"
+        tag["style"] = f"{existing_style} {extra_style}".strip()
+
+    @classmethod
+    def _sanitize_translated_tag(cls, source_tag, translated_tag):
+        if not isinstance(translated_tag, Tag):
+            return
+
+        translated_tag.attrs.pop("id", None)
+        translated_tag.attrs.pop("name", None)
+
+        if not cls._is_note_like_tag(source_tag):
+            return
+
+        translated_tag.name = "p"
+        translated_tag.attrs.pop("epub:type", None)
+        translated_tag.attrs.pop("role", None)
+
+        classes = [cls_name for cls_name in translated_tag.get("class", []) if cls_name not in {"noteEntry", "footnotetext"}]
+        if classes:
+            translated_tag["class"] = classes
+        else:
+            translated_tag.attrs.pop("class", None)
+
+        cls._append_style(
+            translated_tag,
+            "margin-left: 0; text-indent: 0; padding-left: 0; width: auto; max-width: none;",
+        )
 
     def insert_trans(self, p, text, translation_style="", single_translate=False):
         if text is None:
@@ -34,8 +100,9 @@ class EPUBBookLoaderHelper:
             return
         new_p = copy(p)
         new_p.string = text
+        self._sanitize_translated_tag(p, new_p)
         if translation_style != "":
-            new_p["style"] = translation_style
+            self._append_style(new_p, translation_style)
         p.insert_after(new_p)
         if single_translate:
             p.extract()

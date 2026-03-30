@@ -5,9 +5,26 @@ from os import environ as env
 
 from book_maker.loader import BOOK_LOADER_DICT
 from book_maker.translator import MODEL_DICT
+from book_maker.translator.cached_translator import CachedTranslator
 from book_maker.utils import LANGUAGES, TO_LANGUAGE_CODE
 
 DEFAULT_TRANSLATE_TAGS = "auto"
+
+
+def build_translation_cache_context(options, loader, language):
+    translator = loader.translate_model
+    return {
+        "language": language,
+        "translator_class": translator.__class__.__name__,
+        "selected_model_name": options.model,
+        "translator_model": getattr(translator, "model", None),
+        "model_list": options.model_list,
+        "source_lang": options.source_lang,
+        "temperature": options.temperature,
+        "prompt_template": getattr(translator, "prompt_template", None),
+        "prompt_sys_msg": getattr(translator, "prompt_sys_msg", None),
+        "context_flag": options.context_flag,
+    }
 
 
 def parse_prompt_arg(prompt_arg):
@@ -639,6 +656,14 @@ So you are close to reaching the limit. You have to choose your own value, there
         e.translate_model.set_geminipro_models()
 
     e.selected_model_name = options.model
+    cache_context = build_translation_cache_context(options, e, language)
+    e.translate_model = CachedTranslator.from_book_path(
+        e.translate_model,
+        options.book_name,
+        cache_context,
+    )
+    if getattr(e, "helper", None) is not None:
+        e.helper.translate_model = e.translate_model
     e.make_bilingual_book()
 
 

@@ -36,6 +36,7 @@ BOOK_LOADER_DICT = _LazyImportDict(
         "srt": ("book_maker.loader.srt_loader", "SRTBookLoader"),
         "md": ("book_maker.loader.md_loader", "MarkdownBookLoader"),
         "pdf": ("book_maker.loader.pdf_loader", "PDFBookLoader"),
+        "mobi": ("book_maker.loader.pdf_loader", "MOBIBookLoader"),
         # TODO add more here
     }
 )

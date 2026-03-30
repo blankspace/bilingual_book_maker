@@ -76,6 +76,12 @@ def _read_tables(epub_path):
     return tables
 
 
+def _read_document_soup(epub_path):
+    book = epub.read_epub(str(epub_path))
+    document = next(book.get_items_of_type(ITEM_DOCUMENT))
+    return bs(document.content, "html.parser")
+
+
 class BatchEchoModel:
     batch_calls = 0
     single_calls = 0
@@ -286,7 +292,10 @@ def test_epub_default_translate_tags_cover_aside_footnotes(tmp_path):
 
     output_path = tmp_path / "footnotes_bilingual.epub"
     assert output_path.exists()
-    assert _read_tag_texts(output_path, ["h2", "aside"]) == [
+    soup = _read_document_soup(output_path)
+    nodes = soup.find_all(["h2", "aside", "p"])
+    assert [node.name for node in nodes] == ["h2", "h2", "aside", "p", "aside", "p"]
+    assert [node.get_text(" ", strip=True) for node in nodes] == [
         "Notes",
         "ZH::Notes",
         "1 An apparent reference to the maxim.",
@@ -294,6 +303,7 @@ def test_epub_default_translate_tags_cover_aside_footnotes(tmp_path):
         "2 The bond yield represents a portfolio.",
         "ZH:: The bond yield represents a portfolio.",
     ]
+    assert all(node.get("id") is None for node in soup.find_all("p"))
 
 
 def test_epub_tables_are_rendered_as_separate_translated_tables(tmp_path):
@@ -357,6 +367,79 @@ def test_epub_non_translatable_tables_are_not_duplicated(tmp_path):
     assert BatchEchoModel.batch_calls == 0
     assert BatchEchoModel.single_calls == 0
     assert _read_tables(output_path) == [{"caption": None, "rows": [["1", "2"]]}]
+
+
+def test_epub_translated_tables_drop_duplicate_ids(tmp_path):
+    epub_path = tmp_path / "table_ids.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<table id='portfolio-table'><tr><th id='stocks-header'>Stocks</th></tr></table>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    soup = _read_document_soup(tmp_path / "table_ids_bilingual.epub")
+    tables = soup.find_all("table")
+
+    assert len(tables) == 2
+    assert tables[0].get("id") == "portfolio-table"
+    assert tables[1].get("id") is None
+    assert tables[0].find("th").get("id") == "stocks-header"
+    assert tables[1].find("th").get("id") is None
+
+
+def test_epub_translated_rearnotes_drop_note_semantics_and_duplicate_ids(tmp_path):
+    epub_path = tmp_path / "rearnotes.epub"
+    _create_epub_with_html(
+        epub_path,
+        "<section class='notesSet' epub:type='rearnotes'>"
+        "<aside id='note-1' class='noteEntry' epub:type='rearnote'>"
+        "<sup><a href='#note-ref-1'>1</a></sup> William of Occam expressed it more elegantly."
+        "</aside>"
+        "</section>",
+    )
+    BatchEchoModel.reset()
+
+    loader = EPUBBookLoader(
+        str(epub_path),
+        BatchEchoModel,
+        key="",
+        resume=False,
+        language="zh-hans",
+    )
+    loader.exclude_filelist = "nav.xhtml"
+    loader.accumulated_num = 400
+    loader.make_bilingual_book()
+
+    output_path = tmp_path / "rearnotes_bilingual.epub"
+    soup = _read_document_soup(output_path)
+    notes = soup.select(".notesSet > aside, .notesSet > p")
+
+    assert len(notes) == 2
+    assert notes[0].name == "aside"
+    assert notes[0]["id"] == "note-1"
+    assert "noteEntry" in notes[0].get("class", [])
+    assert notes[0].get("epub:type") == "rearnote"
+
+    assert notes[1].name == "p"
+    assert notes[1].get("id") is None
+    assert notes[1].get("epub:type") is None
+    assert "noteEntry" not in notes[1].get("class", [])
+    assert "text-indent: 0;" in notes[1].get("style", "")
+    assert (
+        notes[1].get_text(" ", strip=True)
+        == "ZH:: William of Occam expressed it more elegantly."
+    )
 
 
 def test_epub_invalid_batch_response_falls_back_without_missing_segments(tmp_path):

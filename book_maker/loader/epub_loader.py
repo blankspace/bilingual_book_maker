@@ -405,8 +405,18 @@ class EPUBBookLoader(BaseBookLoader):
     def _get_filtered_translatable_tags(self, root, trans_taglist):
         return self.filter_nest_list(root.find_all(trans_taglist), trans_taglist)
 
+    @staticmethod
+    def _strip_duplicate_identity_attrs(root):
+        if not isinstance(root, Tag):
+            return
+
+        for node in [root, *root.find_all(True)]:
+            node.attrs.pop("id", None)
+            node.attrs.pop("name", None)
+
     def _build_table_translation_target_map(self, table, trans_taglist):
         translation_table = copy(table)
+        self._strip_duplicate_identity_attrs(translation_table)
         table.insert_after(translation_table)
 
         source_nodes = self._get_filtered_translatable_tags(table, trans_taglist)
